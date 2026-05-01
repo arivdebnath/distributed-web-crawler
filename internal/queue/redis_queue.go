@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -66,7 +67,7 @@ var enqueueScript = redis.NewScript(`
 `)
 
 func (queue *RedisQueue) Enqueue(ctx context.Context, job *model.CrawlJob) (bool, error) {
-	jobJson, err := json.Marshal(job)
+	jobJSON, err := json.Marshal(job)
 	if err != nil {
 		return false, fmt.Errorf("failed to marshal job to json: %w", err)
 	}
@@ -76,7 +77,7 @@ func (queue *RedisQueue) Enqueue(ctx context.Context, job *model.CrawlJob) (bool
 		queue.client,
 		[]string{queue.queueKey, queue.visitedKey},
 		job.Url,
-		jobJson,
+		jobJSON,
 	).Int()
 	if err != nil {
 		return false, fmt.Errorf("failed to enqueue job to redis: %w", err)
@@ -88,3 +89,93 @@ func (queue *RedisQueue) Enqueue(ctx context.Context, job *model.CrawlJob) (bool
 
 	return result == 1, nil
 }
+
+func (queue *RedisQueue) EnqueueBatch(ctx context.Context, jobs []*model.CrawlJob) (int, error) {
+	enqueued := 0
+
+	pipe := queue.client.Pipeline()
+	cmds := make([]*redis.Cmd, len(jobs))
+
+	for i, job := range jobs {
+		jobJson, err := json.Marshal(job)
+		if err != nil {
+			return enqueued, fmt.Errorf("failed to marshal job to json: %w", err)
+		}
+		cmds[i] = enqueueScript.Run(ctx, pipe, []string{queue.queueKey, queue.visitedKey}, job.Url, string(jobJson))
+	}
+
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return enqueued, fmt.Errorf("failed to enqueue jobs to redis: %w", err)
+	}
+
+	for _, cmd := range cmds {
+		if v, err := cmd.Int(); err == nil && v == 1 {
+			enqueued++
+		}
+	}
+	if enqueued > 0 {
+		queue.client.HIncrBy(ctx, queue.statsKey, "total_queued", int64(enqueued))
+	}
+	return enqueued, nil
+}
+
+func (queue *RedisQueue) Dequeue(ctx context.Context) (*model.CrawlJob, error) {
+	result, err := queue.client.BRPop(ctx, 5*time.Second, queue.queueKey).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to dequeue job from redis: %w", err)
+	}
+	var job model.CrawlJob
+	error := json.Unmarshal([]byte(result[1]), &job)
+	if error != nil {
+		return nil, fmt.Errorf("failed to unmarshal job from redis: %w", err)
+	}
+
+	err = queue.client.ZAdd(ctx, queue.inflightKey, redis.Z{Score: float64(time.Now().Second()), Member: result[1]}).Err()
+
+	if err != nil {
+		_ = fmt.Errorf("failed to add job to inflight: %w", err)
+	}
+	return &job, nil
+}
+
+func (queue *RedisQueue) Acknowledge(ctx context.Context, job *model.CrawlJob) error {
+	jobJSON, err := json.Marshal(job)
+	if err != nil {
+		return fmt.Errorf("failed to marshal job to json: %w", err)
+	}
+	pipe := queue.client.Pipeline()
+	pipe.ZRem(ctx, queue.inflightKey, string(jobJSON)).Result()
+	pipe.HIncrBy(ctx, queue.statsKey, "total_crawled", 1)
+
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
+func (queue *RedisQueue) Nack(ctx context.Context, job *model.CrawlJob, reason string) error {
+	jobJSON, err := json.Marshal(job)
+	if err != nil {
+		return fmt.Errorf("failed to marshal job to json: %w", err)
+	}
+	pipe := queue.client.Pipeline()
+	pipe.ZRem(ctx, queue.inflightKey, string(jobJSON))
+
+	if job.RetryCount < queue.cfg.MaxRetries {
+		job.RetryCount++
+		retryJob, _ := json.Marshal(job)
+		pipe.LPush(ctx, queue.queueKey, string(retryJob))
+		queue.log.Info("Re-queuing for Retry", zap.String("url", job.Url), zap.Int("retry_count", job.RetryCount))
+	} else {
+		pipe.LPush(ctx, queue.failedKey, string(jobJSON))
+		pipe.HIncrBy(ctx, queue.statsKey, "total_failed", 1)
+		queue.log.Warn("Job moved to DLQ", zap.String("url", job.Url), zap.String("reason", reason))
+	}
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
+//func (queue *RedisQueue) RecoverInFlight(ctx context.Context) error {
+//	inflightJobs, err := queue.client.ZRange(ctx, queue.inflightKey, 0,)
+//}

@@ -9,4 +9,7 @@ type Config struct {
 	//Worker
 	WorkerCount   int
 	WorkerTimeout int
+
+	//Job
+	MaxRetries int
 }
