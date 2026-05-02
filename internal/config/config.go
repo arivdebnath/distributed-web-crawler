@@ -1,5 +1,7 @@
 package config
 
+import "time"
+
 type Config struct {
 	//Redis
 	RedisAddr     string
@@ -11,5 +13,6 @@ type Config struct {
 	WorkerTimeout int
 
 	//Job
-	MaxRetries int
+	MaxRetries      int
+	InflightTimeout time.Duration
 }

@@ -133,7 +133,7 @@ func (queue *RedisQueue) Dequeue(ctx context.Context) (*model.CrawlJob, error) {
 		return nil, fmt.Errorf("failed to unmarshal job from redis: %w", err)
 	}
 
-	err = queue.client.ZAdd(ctx, queue.inflightKey, redis.Z{Score: float64(time.Now().Second()), Member: result[1]}).Err()
+	err = queue.client.ZAdd(ctx, queue.inflightKey, redis.Z{Score: float64(time.Now().Unix()), Member: result[1]}).Err()
 
 	if err != nil {
 		_ = fmt.Errorf("failed to add job to inflight: %w", err)
@@ -176,6 +176,50 @@ func (queue *RedisQueue) Nack(ctx context.Context, job *model.CrawlJob, reason s
 	return err
 }
 
-//func (queue *RedisQueue) RecoverInFlight(ctx context.Context) error {
-//	inflightJobs, err := queue.client.ZRange(ctx, queue.inflightKey, 0,)
-//}
+var ReaperScript = redis.NewScript(`
+	local queueKey = KEYS[1]
+	local inflightKey = KEYS[2]
+	local threshold = tonumber(ARGV[1])
+	
+	local timedoutJob = redis.call("ZRANGEBYSCORE", inflightKey, 0, threshold)
+
+	if #timedoutJob == 0 then
+		return 0
+	end
+
+	for _, job in ipairs(timedoutJob) do
+		redis.call("ZREM", inflightKey, job)
+		redis.call("LPUSH", queueKey, job)
+	end
+
+	return #timedoutJob
+`)
+
+func (queue *RedisQueue) Reap(ctx context.Context) error {
+	threshold := time.Now().Add(-queue.cfg.InflightTimeout).Unix()
+	result, err := ReaperScript.Run(ctx, queue.client, []string{queue.queueKey, queue.inflightKey}, threshold).Result()
+	if err != nil {
+		return err
+	}
+
+	if count, ok := result.(int64); ok && count > 0 {
+		queue.log.Warn("Reaped timed out jobs", zap.Int64("count", count))
+	}
+
+	return nil
+}
+
+func (queue *RedisQueue) QueueDepth(ctx context.Context) (int, error) {
+	result, err := queue.client.LLen(ctx, queue.queueKey).Result()
+
+	if err != nil {
+		queue.log.Warn("Failed to get queue length", zap.Error(err))
+		return 0, err
+	}
+
+	return int(result), nil
+}
+
+func (queue *RedisQueue) Close() error {
+	return queue.client.Close()
+}
