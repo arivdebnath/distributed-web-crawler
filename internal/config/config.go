@@ -1,6 +1,8 @@
 package config
 
-import "time"
+import (
+	"time"
+)
 
 type Config struct {
 	//Redis
@@ -15,4 +17,9 @@ type Config struct {
 	//Job
 	MaxRetries      int
 	InflightTimeout time.Duration
+
+	//Mongo
+	MongoURI        string
+	MongoDB         string
+	MongoCollection string
 }

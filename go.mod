@@ -6,6 +6,7 @@ toolchain go1.21.5
 
 require (
 	github.com/redis/go-redis/v9 v9.18.0
+	go.mongodb.org/mongo-driver v1.17.9
 	go.uber.org/zap v1.27.1
 )
 
